@@ -40,12 +40,10 @@ from .symbols import symbol_to_coin
 
 logger = logging.getLogger("follow_agent.moss_ws")
 
-# 关注的事件类型（会触发 delta 对齐）
+# 关注的事件类型（会触发 delta 对齐）。position.updated 只作为状态通知，
+# order.filled 与 poller fill 通过 order_id/source_order_id 做统一去重。
 _TRADE_EVENT_TYPES = {
     "order.filled",
-    "order.partially_filled",
-    "position.updated",
-    "fill.created",
 }
 
 
@@ -56,6 +54,21 @@ def _get_moss_config() -> dict:
 def _symbol_to_coin(symbol: str) -> str | None:
     """将 Moss symbol 映射为 Hyperliquid coin。"""
     return symbol_to_coin(symbol, _get_moss_config().get("symbol_map", {}))
+
+
+def _event_fill_tid(event: dict) -> str:
+    """Return a unique raw-event key for a Moss WS order event."""
+    event_id = event.get("event_id", "")
+    return f"moss_evt_{event_id}"
+
+
+def _event_process_key(event: dict) -> str:
+    """Return the order-level processing key shared with poller fills."""
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    source_order_id = payload.get("source_order_id") or payload.get("order_id")
+    if source_order_id:
+        return f"moss_order_{source_order_id}"
+    return _event_fill_tid(event)
 
 
 def _normalize_moss_positions(raw_positions: list) -> dict:
@@ -276,24 +289,12 @@ def _handle_source_event(
     symbol = payload.get("symbol", "")
     coin = _symbol_to_coin(symbol)
     if not coin:
-        # position.updated 的 payload 里有 symbol
-        # fill.created 的 payload 里也有 symbol
         logger.debug("No symbol in event %s seq=%d, skipping", event_type, event_seq)
         return
 
     event_id = event.get("event_id", "")
-    # fill.created 事件：优先用 payload.fill_id，与 poller 通道共享去重命名空间
-    # 其他事件（position.updated 等）不会被 poller 轮询，用 event_id 做 WS 内部去重即可
-    fill_id_in_payload = payload.get("fill_id", "")
-    if event_type == "fill.created" and fill_id_in_payload:
-        fill_tid = f"moss_fill_{fill_id_in_payload}"
-    else:
-        fill_tid = f"moss_evt_{event_id}"
-
-    # 去重
-    if db.is_processed_fill_tid(fill_tid):
-        logger.debug("Skipping duplicate event: %s", fill_tid)
-        return
+    fill_tid = _event_fill_tid(event)
+    process_key = _event_process_key(event)
 
     logger.info(
         "Moss WS event: type=%s coin=%s seq=%d event_id=%s",
@@ -311,19 +312,14 @@ def _handle_source_event(
         fill_price=float(payload.get("fill_price", payload.get("price", 0)) or 0),
         tx_hash=None,
         fill_tid=fill_tid,
+        process_key=process_key,
         agent_pos_before=None,
         agent_pos_after=float(payload.get("net_qty", 0) or 0) if "net_qty" in payload else None,
     )
 
-    # coin 级时间窗口保护：近 10s 内已有任意通道成功同步 → 跳过
-    # 覆盖 poller 先成交后 position.updated 再触发 delta sync 的重复下单竞态。
-    # 当前跟单 Agent 低频（约 15 分钟一单），该兜底优先防重复。
-    if db.has_recent_synced_event(coin, seconds=10):
-        logger.info(
-            "Moss WS: %s %s already synced recently by another channel, skipping delta sync",
-            coin, fill_tid,
-        )
-        db.mark_fill_tid_synced(fill_tid)
+    if db.is_synced_process_key(process_key):
+        logger.debug("Skipping already-synced Moss order: %s", process_key)
+        db.mark_process_key_synced(process_key)
         return
 
     our_account = cfg.get("main_address") or cfg.get("wallet_address", "")
@@ -393,6 +389,10 @@ def _handle_source_event(
         return
 
     try:
+        if db.is_synced_process_key(process_key):
+            logger.debug("Skipping already-synced Moss order after lock: %s", process_key)
+            db.mark_process_key_synced(process_key)
+            return
         _t3 = _time.time()
         _do_sync_coin(
             exchange=exchange,
@@ -408,12 +408,12 @@ def _handle_source_event(
             source="moss_ws",
             agent_symbol=symbol or None,
             agent_tx_hash=None,
-            agent_fill_tid=fill_tid,
+            agent_fill_tid=process_key,
             agent_event_id=event_id or None,
         )
         _t4 = _time.time()
         logger.info("Moss WS timing [%s]: _do_sync_coin=%.0fms total=%.0fms", coin, (_t4 - _t3) * 1000, (_t4 - _t0) * 1000)
-        db.mark_fill_tid_synced(fill_tid)
+        db.mark_process_key_synced(process_key)
     except Exception as e:
         logger.exception("Moss WS delta sync error for %s: %s", coin, e)
     finally:

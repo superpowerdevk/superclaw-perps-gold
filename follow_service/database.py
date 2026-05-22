@@ -3,7 +3,7 @@
 
 表结构：
   agent_baseline    — 基线快照（跟单启动时 Agent 的仓位参考点）
-  events            — WebSocket fill 事件（含仓位上下文）
+  events            — Moss 原始事件（fill_tid）+ 订单级处理键（process_key）
   trades            — 我方交易记录（含完整上下文）
   account_snapshots — 账户余额快照（每60s）
   alerts            — 告警队列（余额不足等，Bot 轮询消费）
@@ -70,13 +70,13 @@ def init_db() -> None:
                 fill_price     REAL,
                 tx_hash        TEXT,
                 fill_tid       TEXT UNIQUE,
+                process_key    TEXT,
                 agent_pos_before REAL,
                 agent_pos_after  REAL,
                 raw_payload    TEXT    NOT NULL,
                 created_at     TEXT    NOT NULL,
                 sync_status    TEXT    NOT NULL DEFAULT 'pending'
             );
-
             CREATE TABLE IF NOT EXISTS trades (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
                 source               TEXT    NOT NULL,
@@ -153,6 +153,15 @@ def init_db() -> None:
             )
         except sqlite3.OperationalError:
             pass  # 列已存在，忽略
+        # 存量数据库迁移：添加 process_key 列，用于订单级处理去重
+        try:
+            conn.execute("ALTER TABLE events ADD COLUMN process_key TEXT")
+        except sqlite3.OperationalError:
+            pass  # 列已存在，忽略
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_events_process_key_status "
+            "ON events(process_key, sync_status)"
+        )
         # 存量数据库迁移：trades 表添加 leverage 列
         try:
             conn.execute("ALTER TABLE trades ADD COLUMN leverage INTEGER")
@@ -269,6 +278,7 @@ def log_event(
     fill_price: Optional[float] = None,
     tx_hash: Optional[str] = None,
     fill_tid: Optional[str] = None,
+    process_key: Optional[str] = None,
     agent_pos_before: Optional[float] = None,
     agent_pos_after: Optional[float] = None,
 ) -> None:
@@ -278,17 +288,23 @@ def log_event(
             conn.execute(
                 """INSERT INTO events
                    (agent_address, coin, side, fill_size, fill_price, tx_hash,
-                    fill_tid, agent_pos_before, agent_pos_after, raw_payload, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    fill_tid, process_key, agent_pos_before, agent_pos_after, raw_payload, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     agent_address, coin, side, fill_size, fill_price, tx_hash,
-                    fill_tid, agent_pos_before, agent_pos_after, raw_payload,
+                    fill_tid, process_key, agent_pos_before, agent_pos_after, raw_payload,
                     datetime.utcnow().isoformat(),
                 ),
             )
     except sqlite3.IntegrityError:
-        # duplicate fill_tid — silently ignore
-        pass
+        # duplicate fill_tid — keep the original raw event, but backfill the
+        # order-level process key so upgraded databases can dedupe old rows.
+        if process_key and fill_tid:
+            with get_conn() as conn:
+                conn.execute(
+                    "UPDATE events SET process_key=COALESCE(process_key, ?) WHERE fill_tid=?",
+                    (process_key, fill_tid),
+                )
 
 
 def mark_baseline_init_seen(agent_address: str) -> None:
@@ -325,6 +341,18 @@ def is_synced_fill_tid(tid: str) -> bool:
         return row is not None
 
 
+def is_synced_process_key(process_key: str) -> bool:
+    """检查某个订单级处理键是否已有任意事件同步完成。"""
+    if not process_key:
+        return False
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM events WHERE process_key=? AND sync_status='done' LIMIT 1",
+            (process_key,),
+        ).fetchone()
+        return row is not None
+
+
 def mark_fill_tid_synced(tid: str) -> None:
     """将 fill_tid 标记为同步完成（sync_status='done'）。
 
@@ -336,13 +364,27 @@ def mark_fill_tid_synced(tid: str) -> None:
         )
 
 
+def mark_process_key_synced(process_key: str) -> None:
+    """将同一订单级处理键下的所有事件标记为同步完成。"""
+    if not process_key:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE events SET sync_status='done' WHERE process_key=?", (process_key,)
+        )
+
+
 def get_pending_moss_fill_events(limit: int = 100) -> list[dict]:
     """返回待回填的 Moss fill 事件，供服务重启后补同步。"""
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT *
                FROM events
-               WHERE fill_tid LIKE 'moss_fill_%' AND sync_status='pending'
+               WHERE (
+                   fill_tid LIKE 'moss_fill_%'
+                   OR process_key LIKE 'moss_order_%'
+               )
+                 AND sync_status='pending'
                ORDER BY id ASC
                LIMIT ?""",
             (limit,),
@@ -368,7 +410,11 @@ def get_latest_synced_moss_fill_created_at() -> Optional[str]:
         rows = conn.execute(
             """SELECT raw_payload, created_at
                FROM events
-               WHERE fill_tid LIKE 'moss_fill_%' AND sync_status='done'
+               WHERE (
+                   fill_tid LIKE 'moss_fill_%'
+                   OR process_key LIKE 'moss_order_%'
+               )
+                 AND sync_status='done'
                ORDER BY id DESC
                LIMIT 1000"""
         ).fetchall()
@@ -383,9 +429,11 @@ def get_latest_synced_moss_fill_created_at() -> Optional[str]:
             payload.get("created_at")
             or payload.get("createdAt")
             or payload.get("timestamp")
+            or payload.get("event_time")
             or nested.get("created_at")
             or nested.get("createdAt")
             or nested.get("timestamp")
+            or nested.get("event_time")
         )
         if isinstance(ts, str) and ts:
             timestamps.append(ts)
@@ -400,7 +448,11 @@ def get_earliest_pending_moss_fill_created_at() -> Optional[str]:
         rows = conn.execute(
             """SELECT raw_payload, created_at
                FROM events
-               WHERE fill_tid LIKE 'moss_fill_%' AND sync_status='pending'
+               WHERE (
+                   fill_tid LIKE 'moss_fill_%'
+                   OR process_key LIKE 'moss_order_%'
+               )
+                 AND sync_status='pending'
                ORDER BY id ASC
                LIMIT 1000"""
         ).fetchall()
@@ -415,9 +467,11 @@ def get_earliest_pending_moss_fill_created_at() -> Optional[str]:
             payload.get("created_at")
             or payload.get("createdAt")
             or payload.get("timestamp")
+            or payload.get("event_time")
             or nested.get("created_at")
             or nested.get("createdAt")
             or nested.get("timestamp")
+            or nested.get("event_time")
         )
         if isinstance(ts, str) and ts:
             timestamps.append(ts)

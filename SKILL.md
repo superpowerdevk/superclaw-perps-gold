@@ -733,7 +733,7 @@ Agent Wallet 是 Hyperliquid 官方支持的代理钱包机制。Bot 持有 Agen
 主钱包签名的作用是在 Hyperliquid 链上登记一条授权记录，将 Agent Wallet 绑定为主钱包的代理人。这个过程不会转移任何资产，只是一条链上授权声明。签名后 Agent Wallet 才能代替主钱包下单。
 
 **Q: 跟单是怎么运作的？**
-Bot 通过 Moss 平台的 WebSocket 和 REST API 实时监听你选择的 Agent 的交易行为。当 Agent 发生仓位变化时，Bot 计算差值（delta），按照你设定的比例，用 Agent Wallet 在 Hyperliquid 上同步执行相同方向的交易。整个过程全自动，无需人工干预。
+Bot 通过 Moss 平台的 WebSocket 和 REST API 实时监听你选择的 Agent 的交易行为。WS 只把 `order.filled` 作为跟单触发源，REST poller 轮询 fills 作为兜底；两条通道都会记录原始事件，并用同一个订单级 `process_key`（`moss_order_<order_id>`）判断是否已处理，避免重复下单。确认需要同步时，Bot 计算仓位差值（delta），按照你设定的比例，用 Agent Wallet 在 Hyperliquid 上同步执行相同方向的交易。整个过程全自动，无需人工干预。
 
 **Q: Moss 平台是什么？**
 Moss 是一个交易策略平台，平台上的 Agent 是自动执行交易策略的机器人。用户可以在 Moss 上浏览各个 Agent 的历史表现（收益率、回撤、胜率等），选择自己看好的 Agent 进行跟单。Bot 的信号源来自 Moss 平台。

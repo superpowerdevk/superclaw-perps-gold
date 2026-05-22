@@ -47,6 +47,24 @@ def _symbol_to_coin(symbol: str) -> str | None:
     return symbol_to_coin(symbol, _get_moss_config().get("symbol_map", {}))
 
 
+def _fill_tid_from_fill(fill: dict) -> str:
+    """Return a unique raw-event key for a Moss fill."""
+    if fill.get("_replay_fill_tid"):
+        return str(fill["_replay_fill_tid"])
+    fill_id = fill.get("fill_id", "")
+    return f"moss_fill_{fill_id}"
+
+
+def _process_key_from_fill(fill: dict) -> str:
+    """Return the order-level processing key shared with WS order events."""
+    if fill.get("_replay_process_key"):
+        return str(fill["_replay_process_key"])
+    order_id = fill.get("order_id") or fill.get("source_order_id")
+    if order_id:
+        return f"moss_order_{order_id}"
+    return _fill_tid_from_fill(fill)
+
+
 def _normalize_moss_positions(raw_positions: list) -> tuple[dict, float]:
     """
     将 Moss positions 列表转换为 trader.py 需要的格式。
@@ -317,16 +335,12 @@ def _handle_moss_fill(
         return
 
     fill_id = fill.get("fill_id", "")
-    fill_tid = f"moss_fill_{fill_id}"
+    fill_tid = _fill_tid_from_fill(fill)
+    process_key = _process_key_from_fill(fill)
     side = fill.get("side", "")
     fill_qty = float(fill.get("qty", 0))
     fill_price = float(fill.get("price", 0))
     is_liquidation = fill.get("is_liquidation", False)
-
-    # 去重：该 fill 是否已被任意通道成功同步（sync_status='done'）
-    if db.is_synced_fill_tid(fill_tid):
-        logger.debug("Skipping already-synced Moss fill: %s", fill_tid)
-        return
 
     logger.info(
         "Moss fill detected: %s %s qty=%s price=%s fill_id=%s%s",
@@ -344,18 +358,14 @@ def _handle_moss_fill(
         fill_price=fill_price,
         tx_hash=None,
         fill_tid=fill_tid,
+        process_key=process_key,
         agent_pos_before=None,
         agent_pos_after=None,
     )
 
-    # coin 级时间窗口保护：近 10s 内有任意通道成功同步 → 跳过（覆盖 position.updated 等无 fill_id 的 WS 事件）。
-    # 当前跟单 Agent 低频（约 15 分钟一单），该兜底优先防重复。
-    if db.has_recent_synced_event(coin, seconds=10):
-        logger.info(
-            "Moss poller: %s %s already synced recently by another channel, skipping delta sync",
-            coin, fill_tid,
-        )
-        db.mark_fill_tid_synced(fill_tid)
+    if db.is_synced_process_key(process_key):
+        logger.debug("Skipping already-synced Moss order: %s", process_key)
+        db.mark_process_key_synced(process_key)
         return
 
     our_account = cfg.get("main_address") or cfg.get("wallet_address", "")
@@ -428,6 +438,10 @@ def _handle_moss_fill(
         return
 
     try:
+        if db.is_synced_process_key(process_key):
+            logger.debug("Skipping already-synced Moss order after lock: %s", process_key)
+            db.mark_process_key_synced(process_key)
+            return
         _do_sync_coin(
             exchange=exchange,
             info=info,
@@ -442,10 +456,10 @@ def _handle_moss_fill(
             source="moss",
             agent_symbol=symbol or None,
             agent_tx_hash=None,
-            agent_fill_tid=fill_tid,
+            agent_fill_tid=process_key,
             agent_event_id=str(fill.get("event_id") or "") or None,
         )
-        db.mark_fill_tid_synced(fill_tid)
+        db.mark_process_key_synced(process_key)
     except Exception as e:
         logger.exception("Moss delta sync error for %s: %s", coin, e)
     finally:
@@ -461,11 +475,24 @@ def _fill_from_pending_event(row: dict) -> dict | None:
 
     payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else None
     fill = dict(payload or raw)
-    fill_id = fill.get("fill_id") or str(row.get("fill_tid", "")).removeprefix("moss_fill_")
+    fill["_replay_fill_tid"] = row.get("fill_tid")
+    fill["_replay_process_key"] = row.get("process_key")
+    fill_id = fill.get("fill_id")
+    if not fill_id and str(row.get("fill_tid", "")).startswith("moss_fill_"):
+        fill_id = str(row.get("fill_tid", "")).removeprefix("moss_fill_")
+    order_id = fill.get("order_id") or fill.get("source_order_id")
+    if not order_id and str(row.get("fill_tid", "")).startswith("moss_order_"):
+        order_id = str(row.get("fill_tid", "")).removeprefix("moss_order_")
+    if not order_id and str(row.get("process_key", "")).startswith("moss_order_"):
+        order_id = str(row.get("process_key", "")).removeprefix("moss_order_")
     if not fill_id or not fill.get("symbol"):
-        return None
+        if not order_id or not fill.get("symbol"):
+            return None
 
-    fill["fill_id"] = fill_id
+    if fill_id:
+        fill["fill_id"] = fill_id
+    if order_id:
+        fill["order_id"] = order_id
     if "qty" not in fill and "fill_qty" in fill:
         fill["qty"] = fill.get("fill_qty")
     if "price" not in fill and "fill_price" in fill:
