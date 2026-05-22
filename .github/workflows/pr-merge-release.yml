@@ -1,0 +1,107 @@
+name: PR Merge Release
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: pr-merge-release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout merged main commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - name: Generate release metadata
+        id: meta
+        run: |
+          set -euo pipefail
+
+          TAG_NAME="release-$(date -u +'%Y%m%d-%H%M%S')"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          PACKAGE_NAME="${REPO_NAME}-${TAG_NAME}.tar.gz"
+
+          echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "package_name=${PACKAGE_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "package_path=${RUNNER_TEMP}/${PACKAGE_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "tag_message_path=${RUNNER_TEMP}/tag-message.md" >> "${GITHUB_OUTPUT}"
+          echo "release_body_path=${RUNNER_TEMP}/release-body.md" >> "${GITHUB_OUTPUT}"
+
+      - name: Create tar package
+        run: |
+          set -euo pipefail
+
+          tar \
+            --exclude='./.git' \
+            -czf "${{ steps.meta.outputs.package_path }}" \
+            .
+
+      - name: Create release notes
+        env:
+          TAG_NAME: ${{ steps.meta.outputs.tag_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          TAG_MESSAGE_PATH: ${{ steps.meta.outputs.tag_message_path }}
+          RELEASE_BODY_PATH: ${{ steps.meta.outputs.release_body_path }}
+        run: |
+          set -euo pipefail
+
+          {
+            printf 'PR #%s: %s\n\n' "${PR_NUMBER}" "${PR_TITLE}"
+            if [ -n "${PR_BODY:-}" ]; then
+              printf '%s\n\n' "${PR_BODY}"
+            fi
+            printf 'Source PR: %s\n' "${PR_URL}"
+            printf 'Merge commit: %s\n' "${MERGE_SHA}"
+          } > "${TAG_MESSAGE_PATH}"
+
+          {
+            printf 'Auto release from merged PR #%s\n\n' "${PR_NUMBER}"
+            printf 'PR: %s\n\n' "${PR_URL}"
+            printf '## PR Title\n\n%s\n\n' "${PR_TITLE}"
+            printf '## PR Body\n\n'
+            if [ -n "${PR_BODY:-}" ]; then
+              printf '%s\n' "${PR_BODY}"
+            else
+              printf '_No PR body._\n'
+            fi
+          } > "${RELEASE_BODY_PATH}"
+
+      - name: Create annotated tag
+        env:
+          TAG_NAME: ${{ steps.meta.outputs.tag_name }}
+          TAG_MESSAGE_PATH: ${{ steps.meta.outputs.tag_message_path }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "${TAG_NAME}" -F "${TAG_MESSAGE_PATH}"
+          git push origin "refs/tags/${TAG_NAME}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          name: ${{ steps.meta.outputs.tag_name }}
+          body_path: ${{ steps.meta.outputs.release_body_path }}
+          files: ${{ steps.meta.outputs.package_path }}

@@ -380,4 +380,4 @@ python cli.py --config <path> service start
 
 - There is currently no automated test suite in this repository
 - `README.md` documents the current code path, which uses follower wallet signatures for Moss access
-- `SKILL.md` contains conversation-flow notes for a higher-level skill wrapper, but the runnable project is the Python CLI and `follow_service/` package in this repository
+- `SKILL.md` contains conversation-flow notes for a higher-level skill wrapper, but the runnable project is the Python CLI and `follow_service/` package in this repository.
