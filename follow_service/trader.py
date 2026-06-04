@@ -21,6 +21,7 @@ from hyperliquid.info import Info
 
 from . import config as cfg
 from . import database as db
+from . import hyper_coins
 
 logger = logging.getLogger("follow_agent.trader")
 
@@ -99,6 +100,7 @@ def _build_clients() -> tuple[Exchange, Info]:
         spot_meta = _get_spot_meta(api_url)
         info = Info(api_url, skip_ws=True, spot_meta=spot_meta)
         meta = info.meta()
+        hyper_coins.write_supported_coins_from_meta(meta, api_url=api_url)
         exchange = Exchange(wallet, api_url, meta=meta, account_address=main_address, spot_meta=spot_meta)
         _clients_cache = (exchange, info)
         return exchange, info
@@ -172,18 +174,19 @@ def _get_sz_decimals(info: Info, coin: str) -> int:
 
 
 def _is_coin_tradeable(info: Info, coin: str, source: str = "") -> bool:
-    """Apply shared perp and allowed_coins filters before syncing or opening."""
+    """Apply shared Hyperliquid supported perp coin filters before syncing or opening."""
     log_prefix = f"{source}: " if source else ""
+    canonical_coin = hyper_coins.canonicalize_coin(coin, info=info)
+    check_coin = canonical_coin or coin
 
     if cfg.get("perp_only", True):
-        asset = info.coin_to_asset.get(coin)
+        asset = info.coin_to_asset.get(check_coin)
         if asset is None or asset >= 10000:
-            logger.info("%sSkipping non-perp coin: %s", log_prefix, coin)
+            logger.info("%sSkipping non-perp coin: %s", log_prefix, check_coin)
             return False
 
-    allowed_coins: list = cfg.get("allowed_coins", [])
-    if allowed_coins and coin not in allowed_coins:
-        logger.info("%sSkipping coin not in allowed_coins: %s", log_prefix, coin)
+    if not canonical_coin:
+        logger.info("%sSkipping coin not in Hyperliquid supported coin cache: %s", log_prefix, coin)
         return False
 
     return True
@@ -302,6 +305,25 @@ def _do_sync_coin(
     """
     对单个 coin 执行 delta 对齐逻辑（内部实现，供 execute_delta_sync 和 sync_all_positions 复用）。
     """
+    canonical_coin = hyper_coins.canonicalize_coin(coin, info=info)
+    if canonical_coin and canonical_coin != coin:
+        logger.info("%s: canonicalized coin %s -> %s", source, coin, canonical_coin)
+        if coin in baselines and canonical_coin not in baselines:
+            raw_baseline = baselines[coin]
+            db.upsert_baseline(
+                agent_address=agent_address,
+                coin=canonical_coin,
+                baseline_agent_size=raw_baseline.get("baseline_agent_size", 0.0),
+                our_baseline_size=raw_baseline.get("our_baseline_size", 0.0),
+                init_entry_px=raw_baseline.get("init_entry_px", 0.0),
+                init_pnl_pct=raw_baseline.get("init_pnl_pct"),
+                opened_at_init=raw_baseline.get("opened_at_init", 0),
+            )
+        coin = canonical_coin
+        agent_positions = hyper_coins.canonicalize_positions(agent_positions, info=info)
+        our_positions = hyper_coins.canonicalize_positions(our_positions, info=info)
+        baselines = hyper_coins.canonicalize_positions(baselines, info=info)
+
     _t0_sync = _time.time()
     baseline = baselines.get(coin, {})
     baseline_agent_size = baseline.get("baseline_agent_size", 0.0)

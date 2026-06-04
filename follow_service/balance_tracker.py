@@ -14,6 +14,7 @@ from hyperliquid.info import Info
 
 from . import config as cfg
 from . import database as db
+from . import hyper_coins
 from . import trader
 from .moss_client import MossClient
 from .symbols import symbol_to_coin
@@ -95,7 +96,8 @@ def _check_balance_alert(account_value: float, withdrawable: float) -> None:
 
 def _symbol_to_coin(symbol: str, symbol_map: dict) -> str | None:
     """与 moss_ws / moss_poller 一致的 symbol 映射规则。"""
-    return symbol_to_coin(symbol, symbol_map)
+    coin = symbol_to_coin(symbol, symbol_map)
+    return hyper_coins.canonicalize_coin(coin) or coin
 
 
 def _periodic_sltp_check() -> None:

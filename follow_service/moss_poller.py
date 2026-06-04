@@ -17,6 +17,7 @@ import time as _time
 
 from . import config as cfg
 from . import database as db
+from . import hyper_coins
 from .moss_client import MossClient
 from .trader import (
     _build_clients,
@@ -44,7 +45,8 @@ def _get_moss_config() -> dict:
 
 def _symbol_to_coin(symbol: str) -> str | None:
     """将 Moss symbol 映射为 Hyperliquid coin。"""
-    return symbol_to_coin(symbol, _get_moss_config().get("symbol_map", {}))
+    coin = symbol_to_coin(symbol, _get_moss_config().get("symbol_map", {}))
+    return hyper_coins.canonicalize_coin(coin) or coin
 
 
 def _fill_tid_from_fill(fill: dict) -> str:
@@ -149,6 +151,7 @@ def _init_moss_baseline(
             return
 
         exchange, info = _build_clients()
+        agent_positions = hyper_coins.canonicalize_positions(agent_positions, info=info)
         our_acct_val, _, our_positions = _get_positions(info, our_account)
         mids = info.all_mids()
 
@@ -375,6 +378,7 @@ def _handle_moss_fill(
 
     try:
         exchange, info = _build_clients()
+        coin = hyper_coins.canonicalize_coin(coin, info=info) or coin
     except Exception as e:
         logger.exception("Moss poller: build clients failed: %s", e)
         return
@@ -392,6 +396,7 @@ def _handle_moss_fill(
         return
 
     agent_positions = _normalize_moss_positions(results["moss_positions"])
+    agent_positions = hyper_coins.canonicalize_positions(agent_positions, info=info)
     agent_acct_val = float(results["moss_account"].get("account_value", 0))
     if agent_acct_val <= 0:
         logger.warning("Moss agent account value=0, skipping delta sync for %s", coin)

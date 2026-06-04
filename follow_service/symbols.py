@@ -8,13 +8,21 @@ def symbol_to_coin(symbol: str, symbol_map: dict | None = None) -> str | None:
     if not symbol:
         return None
 
+    symbol = str(symbol).strip()
+    if not symbol:
+        return None
+
     symbol_map = symbol_map or {}
     if symbol in symbol_map:
         return symbol_map[symbol]
 
-    normalized = symbol.replace("-", "")
+    # Moss may emit BTC-USDC or BTC/USDT while Hyperliquid perp coins use BTC.
+    normalized = symbol.replace("-", "").replace("/", "")
     if normalized in symbol_map:
         return symbol_map[normalized]
+
+    if ":" in symbol and not any(normalized.endswith(quote) for quote in _QUOTE_SUFFIXES):
+        return symbol
 
     for quote in _QUOTE_SUFFIXES:
         if normalized.endswith(quote):

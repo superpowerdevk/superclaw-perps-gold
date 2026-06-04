@@ -16,8 +16,10 @@ from pathlib import Path
 
 from . import config as cfg
 from . import database as db
+from . import hyper_coins
 from .logger_setup import setup_logger
 from .balance_tracker import run_balance_tracker, run_sltp_checker
+from .hyper_coins import run_hyper_coin_refresher
 from .moss_poller import run_moss_poller
 from .moss_reporter import run_moss_reporter
 from .moss_ws import run_moss_ws
@@ -125,17 +127,26 @@ def cmd_start() -> None:
             print("Set agent_id first, e.g.: python cli.py --config <config> config set moss_source.agent_id agt_xxx")
             sys.exit(1)
 
-    # 币种白名单：空列表表示不限制；非空则由 trader/init 逻辑统一过滤。
+    # allowed_coins 仅保留为兼容旧配置；跟单限制改为 Hyperliquid 支持币种缓存。
     allowed = cfg.get("allowed_coins", [])
     if allowed:
-        logger.info("allowed_coins whitelist enabled: %s", allowed)
+        logger.info("allowed_coins is ignored for trade filtering; Hyper coin cache is authoritative")
     else:
-        logger.warning("allowed_coins is empty; all supported perp coins may be followed")
+        logger.info("allowed_coins is empty; Hyper coin cache is authoritative")
 
     # Fail fast: 未授权时启动只会持续下单失败，直接阻塞启动并让用户先修配置/授权。
     if not check_authorization(raise_on_fail=False):
         logger.error("Service startup aborted: authorization check failed")
         print("ERROR: authorization check failed. Run `config check-auth` and complete Agent/Builder authorization first.")
+        sys.exit(1)
+
+    try:
+        coin_cache = hyper_coins.refresh_supported_coins(force=True)
+        if not coin_cache.get("coins"):
+            raise RuntimeError("empty Hyperliquid supported coin list")
+    except Exception as e:
+        logger.error("Service startup aborted: cannot refresh Hyper coin cache: %s", e)
+        print("ERROR: 无法获取 Hyperliquid 支持币种列表，请检查网络或 hl_api_url，服务未启动。")
         sys.exit(1)
 
     # Fork to background
@@ -177,6 +188,7 @@ def cmd_start() -> None:
         logger.info("Starting services ...")
 
         coros = [
+            run_hyper_coin_refresher(stop_event),
             run_balance_tracker(stop_event),
             run_sltp_checker(stop_event),
         ]
