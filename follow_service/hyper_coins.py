@@ -72,6 +72,31 @@ def _is_cache_fresh(data: dict[str, Any], api_url: str) -> bool:
     return time.time() - fetched_at < _refresh_secs()
 
 
+_configured_dex_coins_cache: list | None = None
+
+
+def _configured_dex_coins() -> list:
+    """Coins from the configured HIP-3 perp_dex (e.g. 'xyz'), fetched once and
+    merged into every supported-coin cache write so builder-perp coins like
+    'xyz:GOLD' survive the periodic refresh."""
+    global _configured_dex_coins_cache
+    if _configured_dex_coins_cache is not None:
+        return _configured_dex_coins_cache
+    dex = str(cfg.get("perp_dex", "") or "").strip()
+    if not dex:
+        _configured_dex_coins_cache = []
+        return _configured_dex_coins_cache
+    try:
+        r = requests.post(f"{_api_url()}/info", json={"type": "meta", "dex": dex}, timeout=10)
+        r.raise_for_status()
+        _configured_dex_coins_cache = _extract_perp_coins(r.json())
+        logger.info("Loaded %d coins from perp_dex '%s'", len(_configured_dex_coins_cache), dex)
+    except Exception as e:
+        logger.warning("Failed to fetch perp_dex '%s' meta: %s", dex, e)
+        _configured_dex_coins_cache = []
+    return _configured_dex_coins_cache
+
+
 def write_supported_coins(coins: list[str], *, api_url: str | None = None) -> dict[str, Any]:
     """Atomically write the supported perp coin list cache."""
     normalized = []
@@ -81,6 +106,10 @@ def write_supported_coins(coins: list[str], *, api_url: str | None = None) -> di
         value = str(coin).strip()
         if value:
             normalized.append(value)
+    for _dex_coin in _configured_dex_coins():
+        _v = str(_dex_coin).strip()
+        if _v:
+            normalized.append(_v)
     payload = {
         "api_url": api_url or _api_url(),
         "fetched_at": time.time(),
